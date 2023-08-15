@@ -93,7 +93,7 @@ def train(cfg, args):
     if cfg.SEED is not None:
         torch.manual_seed(cfg.SEED)
         np.random.seed(cfg.SEED)
-        random.seed(0)
+        random.seed(cfg.SEED)
 
     # setup training env including loggers
     logging_train_setup(args, cfg)
