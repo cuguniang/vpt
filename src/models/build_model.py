@@ -17,6 +17,7 @@ _MODEL_TYPES = {
     "vit": ViT,
     "swin": Swin,
     "ssl-vit": SSLViT,
+    "mocov3_vitb": SSLViT
 }
 
 
