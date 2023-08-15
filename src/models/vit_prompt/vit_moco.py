@@ -13,6 +13,8 @@ from torch.nn import Conv2d, Dropout
 from timm.models.vision_transformer import _cfg
 
 from ..vit_backbones.vit_moco import VisionTransformerMoCo
+from ..vit_prompt.prompted_block import PromptedAttention, PromptedBlock
+
 from ...utils import logging
 logger = logging.get_logger("visual_prompt")
 
@@ -22,11 +24,18 @@ class PromptedVisionTransformerMoCo(VisionTransformerMoCo):
         super().__init__(**kwargs)
         self.prompt_config = prompt_config
 
-        if self.prompt_config.DEEP and self.prompt_config.LOCATION not in ["prepend", ]:
+        if self.prompt_config.DEEP and self.prompt_config.LOCATION not in ["prepend", "attention"]:
             raise ValueError("Deep-{} is not supported".format(self.prompt_config.LOCATION))
 
         num_tokens = self.prompt_config.NUM_TOKENS
-
+        
+        dpr = [x.item() for x in torch.linspace(0, kwargs.get('drop_path_rate',0.), kwargs.get('depth',12))]  # stochastic depth decay rule
+        self.blocks = nn.Sequential(*[
+            PromptedBlock(
+                dim=kwargs.get('embed_dim',768), num_heads=kwargs.get('num_heads',12), mlp_ratio=kwargs.get('mlp_ratio',4.), qkv_bias=kwargs.get('qkv_bias',True), drop=kwargs.get('drop_rate',0.),
+                attn_drop=kwargs.get('attn_drop_rate',0.), drop_path=dpr[i])
+            for i in range(kwargs.get('depth',12))])
+      
         self.num_tokens = num_tokens
         self.prompt_dropout = Dropout(self.prompt_config.DROPOUT)
 
@@ -38,7 +47,7 @@ class PromptedVisionTransformerMoCo(VisionTransformerMoCo):
                 1, num_tokens, self.embed_dim))
             # xavier_uniform initialization
             nn.init.uniform_(self.prompt_embeddings.data, -val, val)
-            if self.prompt_config.DEEP:
+            if self.prompt_config.DEEP and not self.prompt_config.DEEP_SHARED:
                 self.deep_prompt_embeddings = nn.Parameter(torch.zeros(
                     len(self.blocks) - 1,
                     num_tokens, self.embed_dim
@@ -46,7 +55,13 @@ class PromptedVisionTransformerMoCo(VisionTransformerMoCo):
                 # xavier_uniform initialization
                 nn.init.uniform_(
                     self.deep_prompt_embeddings.data, -val, val)
-
+        
+        elif self.prompt_config.INITIATION == "zero":
+            self.prompt_embeddings = nn.Parameter(torch.zeros(1, num_tokens, self.embed_dim))
+            if self.prompt_config.DEEP:  # noqa
+                self.deep_prompt_embeddings = nn.Parameter(torch.zeros(
+                    len(self.blocks) - 1, num_tokens, self.embed_dim))
+      
         else:
             raise ValueError("Other initiation scheme is not supported")
 
@@ -63,6 +78,8 @@ class PromptedVisionTransformerMoCo(VisionTransformerMoCo):
                     x[:, 1:, :]
                 ), dim=1)
             # (batch_size, cls_token + n_prompt + n_patches, hidden_dim)
+        elif self.prompt_config.LOCATION == "attention":
+            x = self.embeddings(x)
         else:
             raise ValueError("Other prompt locations are not supported")
 
@@ -93,30 +110,45 @@ class PromptedVisionTransformerMoCo(VisionTransformerMoCo):
             for module in self.children():
                 module.train(mode)
 
-    def forward_features(self, x):
+    def forward_features(self, x, prompts=None, mask=None, prompt_type='attention'):
         x = self.incorporate_prompt(x)
-
+        prompts = self.prompt_dropout(self.prompt_embeddings)
+        if self.prompt_config.DEEP and not self.prompt_config.DEEP_SHARED:
+            deep_prompt_embeddings = self.prompt_dropout(self.deep_prompt_embeddings)
+      
         # deep
         if self.prompt_config.DEEP:
             B = x.shape[0]
             num_layers = len(self.blocks)
-
-            for i in range(num_layers):
-                if i == 0:
-                    x = self.blocks[i](x)
-                else:
-                    # prepend
-                    x = torch.cat((
-                        x[:, :1, :],
-                        self.prompt_dropout(
-                            self.deep_prompt_embeddings[i-1].expand(B, -1, -1)
-                        ),
-                        x[:, (1 + self.num_tokens):, :]
-                    ), dim=1)
-                    x = self.blocks[i](x)
+            
+            if self.prompt_config.LOCATION == "attention":
+                for i in range(num_layers):
+                    if i==0:
+                        x, _attn = self.blocks[i](x, mask=None, prompts=prompts[0,:,:],prompt_type=prompt_type)
+                    else:
+                        if self.prompt_config.DEEP_SHARED:
+                            x, _attn = self.blocks[i](x, mask=None, prompts=prompts[0,:,:], prompt_type=prompt_type)
+                        else:
+                            x, _attn = self.blocks[i](x, mask=None, prompts=deep_prompt_embeddings[i-1], prompt_type=prompt_type)
+            else:
+                for i in range(num_layers):
+                    if i == 0:
+                        x = self.blocks[i](x)
+                    else:
+                        # prepend
+                        x = torch.cat((
+                            x[:, :1, :],
+                            self.prompt_dropout(
+                                self.deep_prompt_embeddings[i-1].expand(B, -1, -1)
+                            ),
+                            x[:, (1 + self.num_tokens):, :]
+                        ), dim=1)
+                        x = self.blocks[i](x, mask=None)
+      
         else:
             # not deep:
-            x = self.blocks(x)
+            for blk in self.blocks:
+                x = blk(x)
 
         x = self.norm(x)
         if self.dist_token is None:
